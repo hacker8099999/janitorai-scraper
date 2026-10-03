@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Scrape a JanitorAI profile page into a local HTML/CSS export."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:  # pragma: no cover
+    sync_playwright = None
+
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def parse_cookie_string(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+
+    if raw.strip().startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+
+    cookies: dict[str, str] = {}
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def build_requests_session(cookies: dict[str, str] | None = None) -> requests.Session:
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    if cookies:
+        session.cookies.update(cookies)
+    return session
+
+
+def fetch_html(url: str, use_browser: bool = False, cookies: dict[str, str] | None = None, wait_for_selector: str | None = None) -> str:
+    if use_browser:
+        return fetch_html_with_playwright(url, cookies=cookies, wait_for_selector=wait_for_selector)
+
+    session = build_requests_session(cookies)
+    response = session.get(url, timeout=30, allow_redirects=True)
+    response.raise_for_status()
+    return response.text
+
+
+def fetch_html_with_playwright(
+    url: str,
+    cookies: dict[str, str] | None = None,
+    wait_for_selector: str | None = None,
+) -> str:
+    if sync_playwright is None:
+        raise RuntimeError(
+            "Playwright is not installed. Install it with `pip install playwright` and `playwright install chromium`."
+        )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=DEFAULT_HEADERS["User-Agent"])
+        if cookies:
+            context.add_cookies(
+                [{"name": k, "value": v, "url": url} for k, v in cookies.items()]
+            )
+        page = context.new_page(viewport={"width": 1440, "height": 2200})
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        if wait_for_selector:
+            page.wait_for_selector(wait_for_selector, timeout=30000)
+        html = page.content()
+        browser.close()
+        return html
+
+
+def extract_profile_metadata(soup: BeautifulSoup) -> dict[str, str]:
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+
+    description_tag = (
+        soup.find("meta", attrs={"name": "description"})
+        or soup.find("meta", attrs={"property": "og:description"})
+        or soup.find("meta", attrs={"name": "twitter:description"})
+    )
+    description = description_tag.get("content", "") if description_tag else ""
+
+    heading = soup.find("h1") or soup.find("h2")
+    profile_name = heading.get_text(" ", strip=True) if heading else ""
+
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and not profile_name:
+        profile_name = og_title.get("content", "")
+
+    return {
+        "title": title,
+        "meta_description": description,
+        "profile_name": profile_name,
+    }
+
+
+def collect_inline_css(soup: BeautifulSoup) -> list[str]:
+    css_blocks: list[str] = []
+
+    for style_tag in soup.find_all("style"):
+        content = style_tag.get_text(strip=True)
+        if content:
+            css_blocks.append(content)
+
+    for tag in soup.find_all(True):
+        style_attr = tag.get("style")
+        if style_attr:
+            css_blocks.append(style_attr.strip())
+
+    return css_blocks
+
+
+def dedupe(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def collect_stylesheet_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    stylesheets: list[str] = []
+    for tag in soup.find_all("link"):
+        rel_values = tag.get("rel", [])
+        if isinstance(rel_values, str):
+            rel_values = [rel_values]
+        href = tag.get("href")
+        if href and "stylesheet" in rel_values:
+            stylesheets.append(urljoin(base_url, href))
+    return dedupe(stylesheets)
+
+
+def download_stylesheets(session: requests.Session, urls: Iterable[str]) -> list[tuple[str, str]]:
+    css_payloads: list[tuple[str, str]] = []
+    for url in urls:
+        try:
+            response = session.get(url, timeout=30)
+        except requests.RequestException:
+            continue
+
+        if response.status_code != 200:
+            continue
+
+        content_type = response.headers.get("Content-Type", "")
+        if "css" not in content_type.lower() and not url.lower().endswith(".css"):
+            continue
+
+        css_payloads.append((url, response.text))
+    return css_payloads
+
+
+def resolve_css_imports(session: requests.Session, css_text: str, base_url: str) -> list[str]:
+    imports: list[str] = []
+    pattern = r'@import\s+(?:url\()?["\']?([^"\')]+)["\']?\)?'
+    for match in re.finditer(pattern, css_text, flags=re.IGNORECASE):
+        imported_url = match.group(1)
+        if imported_url.startswith("data:"):
+            continue
+        imports.append(urljoin(base_url, imported_url))
+    return dedupe(imports)
+
+
+def collect_css_assets(session: requests.Session, soup: BeautifulSoup, base_url: str) -> list[str]:
+    css_blocks = collect_inline_css(soup)
+    stylesheet_urls = collect_stylesheet_urls(soup, base_url)
+
+    for stylesheet_url in stylesheet_urls:
+        try:
+            response = session.get(stylesheet_url, timeout=30)
+        except requests.RequestException:
+            continue
+
+        if response.status_code != 200:
+            continue
+
+        css_text = response.text
+        if css_text:
+            css_blocks.append(css_text)
+
+        for imported in resolve_css_imports(session, css_text, stylesheet_url):
+            try:
+                imported_response = session.get(imported, timeout=30)
+            except requests.RequestException:
+                continue
+            if imported_response.status_code == 200 and imported_response.text:
+                css_blocks.append(imported_response.text)
+
+    return dedupe(css_blocks)
+
+
+def save_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def build_summary(url: str, metadata: dict[str, str], css_block_count: int, stylesheet_count: int) -> dict[str, Any]:
+    return {
+        "url": url,
+        "profile_name": metadata.get("profile_name", ""),
+        "title": metadata.get("title", ""),
+        "meta_description": metadata.get("meta_description", ""),
+        "inline_css_blocks": css_block_count,
+        "stylesheet_links": stylesheet_count,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Scrape a JanitorAI profile page into HTML/CSS exports.")
+    parser.add_argument("--url", required=True, help="The JanitorAI profile URL to scrape.")
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="Directory for the scraped HTML, CSS, and summary files.",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="Use Playwright to render the page, useful for JavaScript-heavy profile pages.",
+    )
+    parser.add_argument(
+        "--wait-for-selector",
+        default=None,
+        help="Optional CSS selector to wait for before capturing the page in browser mode.",
+    )
+    parser.add_argument(
+        "--cookies",
+        default=None,
+        help="Optional cookies as a JSON object or set of 'name=value; name=value' pairs.",
+    )
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    css_dir = output_dir / "css"
+    css_dir.mkdir(parents=True, exist_ok=True)
+
+    cookies = parse_cookie_string(args.cookies)
+
+    try:
+        raw_html = fetch_html(
+            args.url,
+            use_browser=args.browser,
+            cookies=cookies,
+            wait_for_selector=args.wait_for_selector,
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"Failed to fetch the profile page: {exc}")
+        return 1
+
+    soup = BeautifulSoup(raw_html, "lxml")
+    metadata = extract_profile_metadata(soup)
+
+    session = build_requests_session(cookies)
+    css_blocks = collect_css_assets(session, soup, args.url)
+    stylesheet_urls = collect_stylesheet_urls(soup, args.url)
+
+    save_text(output_dir / "profile.html", raw_html)
+    save_text(output_dir / "profile.css", "\n\n".join(css_blocks))
+
+    for index, stylesheet_url in enumerate(stylesheet_urls, start=1):
+        try:
+            response = session.get(stylesheet_url, timeout=30)
+        except requests.RequestException:
+            continue
+        if response.status_code == 200 and response.text:
+            save_text(css_dir / f"stylesheet_{index}.css", response.text)
+
+    summary = build_summary(
+        args.url,
+        metadata,
+        len(css_blocks),
+        len(stylesheet_urls),
+    )
+    save_text(output_dir / "profile_summary.json", json.dumps(summary, indent=2, ensure_ascii=False))
+
+    print(f"Saved HTML to: {output_dir / 'profile.html'}")
+    print(f"Saved CSS to: {output_dir / 'profile.css'}")
+    print(f"Saved summary to: {output_dir / 'profile_summary.json'}")
+    print(f"Found {len(stylesheet_urls)} stylesheet URLs and {len(css_blocks)} CSS blocks.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
